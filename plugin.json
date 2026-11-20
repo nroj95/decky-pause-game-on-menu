@@ -1,0 +1,11 @@
+{
+  "name": "Pause Game on Menu",
+  "author": "nroj95",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["pause", "mute", "quick access menu"],
+    "description": "Pauses the game while the … menu is open and mutes it while the … or Steam menu is open.",
+    "image": ""
+  }
+}

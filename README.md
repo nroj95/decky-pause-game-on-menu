@@ -11,6 +11,9 @@ A small [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin
 - **Mute game sound while … or Steam menu is open** — mutes only the game's own audio streams and unmutes
   exactly those when the menu closes.
 
+While a game runs, the panel also shows both switches **for that game only** (e.g. no pause for a multiplayer game,
+or sound kept on for one). They start out like the global switches; changed ones are saved per game.
+
 Steam's screensaver and Steam's own pages over the game (Home, Library, Store, … opened from the Steam menu)
 count as "…": the game stays paused and muted while they show, and resumes when you are back in it.
 

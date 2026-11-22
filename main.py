@@ -22,8 +22,13 @@ How (and why this way)
     itself whether it may pause.
   - Runs as the normal user (no root flag). Decky's bundled LD_LIBRARY_PATH is removed for pactl.
 
-Settings: <DECKY_PLUGIN_SETTINGS_DIR>/settings.json — {"pause_on_quick_access": bool, "mute_on_menus": bool}
-Callable from the frontend: get_settings(), set_setting(key, value), menu_changed(menu)
+Settings: <DECKY_PLUGIN_SETTINGS_DIR>/settings.json —
+  {"pause_on_quick_access": bool, "mute_on_menus": bool,
+   "games": {"<appid>": {"pause_on_quick_access": bool, "mute_on_menus": bool}}}
+  "games" holds per-game exceptions to the two switches (only the keys that differ); a game without
+  an entry follows the global switches. Setting a game's switch back to the global value removes it.
+Callable from the frontend: get_settings(), set_setting(key, value),
+  set_game_setting(appid, key, value), menu_changed(menu, appid)
 """
 import ctypes
 import json
@@ -125,11 +130,15 @@ def _pactl(*args: str) -> str:
 
 class Plugin:
     async def _main(self):
-        self.settings = dict(DEFAULT_SETTINGS)
+        self.settings = {**DEFAULT_SETTINGS, "games": {}}
         try:
             with open(SETTINGS_FILE) as f:
-                self.settings.update({k: v for k, v in json.load(f).items() if k in DEFAULT_SETTINGS})
-        except (OSError, ValueError):
+                saved = json.load(f)
+            self.settings.update({k: v for k, v in saved.items() if k in DEFAULT_SETTINGS})
+            self.settings["games"] = {
+                str(appid): {k: bool(v) for k, v in keys.items() if k in DEFAULT_SETTINGS}
+                for appid, keys in saved.get("games", {}).items() if isinstance(keys, dict)}
+        except (OSError, ValueError, AttributeError):
             pass
         self.paused_window: int | None = None   # window we sent FocusOut to
         self.muted_streams: set[int] = set()    # sink-input indexes we muted
@@ -144,11 +153,31 @@ class Plugin:
         if key not in DEFAULT_SETTINGS:
             return
         self.settings[key] = bool(value)
+        self._save()
+
+    async def set_game_setting(self, appid: int, key: str, value: bool):
+        """Per-game exception; a value equal to the global switch removes the exception."""
+        if key not in DEFAULT_SETTINGS or not appid:
+            return
+        game = self.settings["games"].setdefault(str(appid), {})
+        if bool(value) == self.settings[key]:
+            game.pop(key, None)
+        else:
+            game[key] = bool(value)
+        if not game:
+            del self.settings["games"][str(appid)]
+        self._save()
+
+    def _save(self):
         os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
         with open(SETTINGS_FILE, "w") as f:
             json.dump(self.settings, f, indent=2)
 
-    async def menu_changed(self, menu: int):
+    def _setting(self, key: str, appid: int) -> bool:
+        """The switch for this game: its exception if it has one, else the global switch."""
+        return self.settings["games"].get(str(appid), {}).get(key, self.settings[key])
+
+    async def menu_changed(self, menu: int, appid: int = 0):
         try:
             if menu == MENU_NONE:
                 self._resume()
@@ -156,10 +185,11 @@ class Plugin:
             game = _game_pids()
             if not game:
                 return
-            if menu == MENU_QUICK_ACCESS and self.settings["pause_on_quick_access"] and self.paused_window is None:
+            if (menu == MENU_QUICK_ACCESS and self._setting("pause_on_quick_access", appid)
+                    and self.paused_window is None):
                 self.paused_window = _send_focus(FOCUS_OUT)
                 decky.logger.info("paused: FocusOut to window %s", self.paused_window)
-            if self.settings["mute_on_menus"] and not self.muted_streams:
+            if self._setting("mute_on_menus", appid) and not self.muted_streams:
                 # Native PipeWire streams carry no process id themselves; their client does.
                 client_pids = {str(c["index"]): c.get("properties", {}).get("application.process.id")
                                for c in json.loads(_pactl("-f", "json", "list", "clients"))}

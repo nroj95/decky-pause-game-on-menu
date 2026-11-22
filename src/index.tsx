@@ -30,18 +30,31 @@
  * signal: SteamUIWindows[0].m_CompositionStateStore.m_eLatestCompositionState, 3 = Opaque.
  * Steam sets it 1 ms before it closes the menu, so the game stays muted until it is 0 again.
  *
- * Panel: two switches, stored by the backend (settings.json in Decky's settings folder).
+ * Panel: two global switches, and while a game runs, the same two for that game only (e.g. no
+ * pause for a multiplayer game, sound kept on for another). Per-game values start out like the
+ * global ones and are stored as exceptions by Steam app id; the backend (settings.json in Decky's
+ * settings folder) applies them. menu_changed gets the running app id for that.
  */
 import { PanelSection, PanelSectionRow, Router, ToggleField, findModuleExport, staticClasses } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useEffect, useState } from "react";
 import { FaPause } from "react-icons/fa";
 
-type Settings = { pause_on_quick_access: boolean; mute_on_menus: boolean };
+type Switch = "pause_on_quick_access" | "mute_on_menus";
+// the two global switches, plus per-game exceptions by Steam app id (only the switches that differ)
+type Settings = Record<Switch, boolean> & { games: Record<string, Partial<Record<Switch, boolean>>> };
 
 const getSettings = callable<[], Settings>("get_settings");
-const setSetting = callable<[key: keyof Settings, value: boolean], void>("set_setting");
-const menuChanged = callable<[menu: number], void>("menu_changed");
+const setSetting = callable<[key: Switch, value: boolean], void>("set_setting");
+const setGameSetting = callable<[appid: number, key: Switch, value: boolean], void>("set_game_setting");
+const menuChanged = callable<[menu: number, appid: number], void>("menu_changed");
+
+/** A switch for one game: its exception if it has one, else the global switch. */
+function gameSetting(settings: Settings, key: Switch, appid: number): boolean {
+  return settings.games?.[String(appid)]?.[key] ?? settings[key];
+}
+
+const runningAppId = () => Number(Router.MainRunningApp?.appid) || 0;
 
 /**
  * Subscribe to a MobX value in a store of Steam's main window (SteamUIWindows[0][store][key]).
@@ -105,15 +118,16 @@ function report() {
   const menu = screensaverActive || gameCovered ? 2 : sideMenu;
   if (menu === reportedMenu) return;
   reportedMenu = menu;
-  signalOverlay(menu);
-  void menuChanged(menu);
+  const appid = runningAppId();
+  signalOverlay(menu, appid);
+  void menuChanged(menu, appid);
 }
 
 let stopWatching: (() => void) | null = null;
 let stopWatchingComposition: (() => void) | null = null;
 let stopWatchingScreensaver: (() => void) | null = null;
-// the pause switch, kept here too because the overlay signal is sent from the frontend
-let pauseOnQuickAccess = false;
+// the settings, kept here too because the overlay signal is sent from the frontend
+let currentSettings: Settings | null = null;
 // app id we told "overlay active", until we tell it "inactive" again
 let overlaySignalled: number | null = null;
 
@@ -126,10 +140,9 @@ function setGameOverlay(active: boolean, appid: number) {
 }
 
 /** Steam's overlay signal around "…": "active" when it opens, "inactive" when it closes. */
-function signalOverlay(menu: number) {
-  if (menu === 2 && pauseOnQuickAccess && overlaySignalled === null) {
-    const appid = Number(Router.MainRunningApp?.appid);
-    if (!appid) return;
+function signalOverlay(menu: number, appid: number) {
+  if (menu === 2 && overlaySignalled === null && appid
+      && currentSettings && gameSetting(currentSettings, "pause_on_quick_access", appid)) {
     setGameOverlay(true, appid);
     overlaySignalled = appid;
   } else if (menu === 0 && overlaySignalled !== null) {
@@ -143,45 +156,85 @@ function signalOverlay(menu: number) {
 function Content() {
   const [settings, setSettings] = useState<Settings | null>(null);
   useEffect(() => { void getSettings().then(setSettings); }, []);
+  const app = Router.MainRunningApp;
+  const appid = runningAppId();
 
-  const toggle = (key: keyof Settings) => (value: boolean) => {
-    setSettings((old) => old && { ...old, [key]: value });
-    if (key === "pause_on_quick_access") pauseOnQuickAccess = value;
+  const update = (next: Settings) => {
+    currentSettings = next;
+    setSettings(next);
+  };
+
+  const toggle = (key: Switch) => (value: boolean) => {
+    if (!settings) return;
+    update({ ...settings, [key]: value });
     void setSetting(key, value);
   };
 
+  // per-game exception; choosing the global value again removes it (as the backend does)
+  const toggleGame = (key: Switch) => (value: boolean) => {
+    if (!settings) return;
+    const game = { ...settings.games[String(appid)], [key]: value };
+    if (value === settings[key]) delete game[key];
+    const games = { ...settings.games, [String(appid)]: game };
+    if (!Object.keys(game).length) delete games[String(appid)];
+    update({ ...settings, games });
+    void setGameSetting(appid, key, value);
+  };
+
   return (
-    <PanelSection>
-      {!stopWatching && (
-        <PanelSectionRow>
-          <div>Not working: this Steam version doesn't report its menus the way the plugin expects.</div>
-        </PanelSectionRow>
-      )}
-      {settings && (
-        <>
+    <>
+      <PanelSection>
+        {!stopWatching && (
+          <PanelSectionRow>
+            <div>Not working: this Steam version doesn't report its menus the way the plugin expects.</div>
+          </PanelSectionRow>
+        )}
+        {settings && (
+          <>
+            <PanelSectionRow>
+              <ToggleField
+                label="Pause game while … menu is open"
+                description="For games that pause on the Steam menu (like Kena) or when their window is inactive (like Stardew Valley)."
+                checked={settings.pause_on_quick_access}
+                onChange={toggle("pause_on_quick_access")}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ToggleField
+                label="Mute game sound while … or Steam menu is open"
+                checked={settings.mute_on_menus}
+                onChange={toggle("mute_on_menus")}
+              />
+            </PanelSectionRow>
+          </>
+        )}
+      </PanelSection>
+      {settings && appid > 0 && (
+        <PanelSection title={app?.display_name ?? "This game"}>
           <PanelSectionRow>
             <ToggleField
-              label="Pause game while … menu is open"
-              description="For games that pause on the Steam menu (like Kena) or when their window is inactive (like Stardew Valley)."
-              checked={settings.pause_on_quick_access}
-              onChange={toggle("pause_on_quick_access")}
+              label="Pause on … menu"
+              description="Only for this game. Starts out like the switch above."
+              checked={gameSetting(settings, "pause_on_quick_access", appid)}
+              onChange={toggleGame("pause_on_quick_access")}
             />
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField
-              label="Mute game sound while … or Steam menu is open"
-              checked={settings.mute_on_menus}
-              onChange={toggle("mute_on_menus")}
+              label="Mute in menus"
+              description="Only for this game. Starts out like the switch above."
+              checked={gameSetting(settings, "mute_on_menus", appid)}
+              onChange={toggleGame("mute_on_menus")}
             />
           </PanelSectionRow>
-        </>
+        </PanelSection>
       )}
-    </PanelSection>
+    </>
   );
 }
 
 export default definePlugin(() => {
-  void getSettings().then((settings) => { pauseOnQuickAccess = settings.pause_on_quick_access; });
+  void getSettings().then((settings) => { currentSettings = settings; });
   // Steam marks the game as covered just before it closes the menu (e.g. Steam menu → Home)
   gameCovered = (window as any).SteamUIStore?.WindowStore?.SteamUIWindows?.[0]?.m_CompositionStateStore
     ?.m_eLatestCompositionState === COMPOSITION_OPAQUE;

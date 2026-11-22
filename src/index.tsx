@@ -25,6 +25,11 @@
  * When it ends, Steam restores the menu you were in a moment later, so the game only resumes if no
  * menu is open 0.5 s after the screensaver (no split-second resume in between).
  *
+ * Steam's UI covering the game also counts as "…" (e.g. Steam menu → Home/Library: the Steam menu
+ * closes but the game stays hidden). We watch the same MobX value Steam uses for its own overlay
+ * signal: SteamUIWindows[0].m_CompositionStateStore.m_eLatestCompositionState, 3 = Opaque.
+ * Steam sets it 1 ms before it closes the menu, so the game stays muted until it is 0 again.
+ *
  * Panel: two switches, stored by the backend (settings.json in Decky's settings folder).
  */
 import { PanelSection, PanelSectionRow, Router, ToggleField, findModuleExport, staticClasses } from "@decky/ui";
@@ -38,20 +43,26 @@ const getSettings = callable<[], Settings>("get_settings");
 const setSetting = callable<[key: keyof Settings, value: boolean], void>("set_setting");
 const menuChanged = callable<[menu: number], void>("menu_changed");
 
-/** Subscribe to Steam's open-side-menu value. Returns an unsubscribe function, or null if not found. */
-function watchSideMenu(onChange: (menu: number) => void): (() => void) | null {
+/**
+ * Subscribe to a MobX value in a store of Steam's main window (SteamUIWindows[0][store][key]).
+ * Returns an unsubscribe function, or null if not found.
+ */
+function watchSteamValue(store: string, key: string, onChange: (value: number) => void): (() => void) | null {
   try {
-    const menuStore = (window as any).SteamUIStore?.WindowStore?.SteamUIWindows?.[0]?.m_MenuStore;
-    const mobxAdmin = Object.getOwnPropertySymbols(menuStore ?? {})
+    const target = (window as any).SteamUIStore?.WindowStore?.SteamUIWindows?.[0]?.[store];
+    const mobxAdmin = Object.getOwnPropertySymbols(target ?? {})
       .find((symbol) => symbol.description === "mobx administration");
-    const observable = mobxAdmin && menuStore[mobxAdmin]?.values_?.get("m_eOpenSideMenu");
+    const observable = mobxAdmin && target[mobxAdmin]?.values_?.get(key);
     if (typeof observable?.observe_ !== "function") return null;
     return observable.observe_((change: { newValue: number }) => onChange(change.newValue));
   } catch (error) {
-    console.error("Pause Game on Menu: cannot watch Steam's menus", error);
+    console.error(`Pause Game on Menu: cannot watch Steam's ${key}`, error);
     return null;
   }
 }
+
+// Steam's composition state 3 = Opaque: its UI covers the game completely (Home, Library, Store, ...)
+const COMPOSITION_OPAQUE = 3;
 
 // Steam's screensaver service (the one its "Preview" button and screensaver page use)
 const screensaver = findModuleExport(
@@ -80,16 +91,18 @@ async function isScreensaverActive(): Promise<boolean> {
   }
 }
 
-// What we last reported: the open side menu, except that an active screensaver counts as "…".
-// Steam closes "…" to show the screensaver; without this the game resumed and unmuted behind it.
+// What we last reported: the open side menu, except that an active screensaver or Steam's UI
+// covering the game counts as "…". Steam closes its menus to show those; without this the game
+// resumed and unmuted behind them.
 let sideMenu = 0;
 let screensaverActive = false;
+let gameCovered = false;
 let reportedMenu = 0;
 let screensaverEndTimer = 0;
 const SCREENSAVER_END_GRACE_MS = 500;
 
 function report() {
-  const menu = screensaverActive ? 2 : sideMenu;
+  const menu = screensaverActive || gameCovered ? 2 : sideMenu;
   if (menu === reportedMenu) return;
   reportedMenu = menu;
   signalOverlay(menu);
@@ -97,6 +110,7 @@ function report() {
 }
 
 let stopWatching: (() => void) | null = null;
+let stopWatchingComposition: (() => void) | null = null;
 let stopWatchingScreensaver: (() => void) | null = null;
 // the pause switch, kept here too because the overlay signal is sent from the frontend
 let pauseOnQuickAccess = false;
@@ -168,7 +182,14 @@ function Content() {
 
 export default definePlugin(() => {
   void getSettings().then((settings) => { pauseOnQuickAccess = settings.pause_on_quick_access; });
-  stopWatching = watchSideMenu((menu) => {
+  // Steam marks the game as covered just before it closes the menu (e.g. Steam menu → Home)
+  gameCovered = (window as any).SteamUIStore?.WindowStore?.SteamUIWindows?.[0]?.m_CompositionStateStore
+    ?.m_eLatestCompositionState === COMPOSITION_OPAQUE;
+  stopWatchingComposition = watchSteamValue("m_CompositionStateStore", "m_eLatestCompositionState", (state) => {
+    gameCovered = state === COMPOSITION_OPAQUE;
+    report();
+  });
+  stopWatching = watchSteamValue("m_MenuStore", "m_eOpenSideMenu", (menu) => {
     sideMenu = menu;
     // a menu closing may be Steam making room for the screensaver: ask before resuming the game
     if (menu === 0) void isScreensaverActive().then((active) => { screensaverActive = active; report(); });
@@ -196,6 +217,8 @@ export default definePlugin(() => {
     onDismount() {
       stopWatching?.();
       stopWatching = null;
+      stopWatchingComposition?.();
+      stopWatchingComposition = null;
       stopWatchingScreensaver?.();
       stopWatchingScreensaver = null;
       clearTimeout(screensaverEndTimer);

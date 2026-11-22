@@ -18,9 +18,16 @@
  * a game already in its pause menu stays paused. When "…" closes we send "inactive"; when it turns
  * into the Steam menu we leave that to Steam, which sends "active" for it and "inactive" afterwards.
  *
+ * Steam's screensaver counts as "…": Steam closes "…" to show it, which used to resume and unmute
+ * the game behind the screensaver. The frontend listens to the screensaver service's own
+ * notification (RegisterForNotifyActiveStateChanged, found with findModuleExport) and, when a menu
+ * closes, first asks GetActiveState, so the game stays paused and muted until the screensaver ends.
+ * When it ends, Steam restores the menu you were in a moment later, so the game only resumes if no
+ * menu is open 0.5 s after the screensaver (no split-second resume in between).
+ *
  * Panel: two switches, stored by the backend (settings.json in Decky's settings folder).
  */
-import { PanelSection, PanelSectionRow, Router, ToggleField, staticClasses } from "@decky/ui";
+import { PanelSection, PanelSectionRow, Router, ToggleField, findModuleExport, staticClasses } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useEffect, useState } from "react";
 import { FaPause } from "react-icons/fa";
@@ -46,7 +53,51 @@ function watchSideMenu(onChange: (menu: number) => void): (() => void) | null {
   }
 }
 
+// Steam's screensaver service (the one its "Preview" button and screensaver page use)
+const screensaver = findModuleExport(
+  (e: any) => typeof e?.RegisterForNotifyActiveStateChanged === "function" && typeof e?.ForceScreensaver === "function",
+);
+
+/** Subscribe to screensaver on/off. Returns an unsubscribe function, or null if not found. */
+function watchScreensaver(onChange: (active: boolean) => void): (() => void) | null {
+  try {
+    const registration = screensaver?.RegisterForNotifyActiveStateChanged((msg: any) => {
+      onChange(Boolean(msg.Body().active()));
+      return 1; // EResult OK, as Steam's own handler returns
+    });
+    return registration ? () => registration.unregister() : null;
+  } catch (error) {
+    console.error("Pause Game on Menu: cannot watch the screensaver", error);
+    return null;
+  }
+}
+
+async function isScreensaverActive(): Promise<boolean> {
+  try {
+    return Boolean((await screensaver?.GetActiveState({}))?.Body().active());
+  } catch {
+    return false;
+  }
+}
+
+// What we last reported: the open side menu, except that an active screensaver counts as "…".
+// Steam closes "…" to show the screensaver; without this the game resumed and unmuted behind it.
+let sideMenu = 0;
+let screensaverActive = false;
+let reportedMenu = 0;
+let screensaverEndTimer = 0;
+const SCREENSAVER_END_GRACE_MS = 500;
+
+function report() {
+  const menu = screensaverActive ? 2 : sideMenu;
+  if (menu === reportedMenu) return;
+  reportedMenu = menu;
+  signalOverlay(menu);
+  void menuChanged(menu);
+}
+
 let stopWatching: (() => void) | null = null;
+let stopWatchingScreensaver: (() => void) | null = null;
 // the pause switch, kept here too because the overlay signal is sent from the frontend
 let pauseOnQuickAccess = false;
 // app id we told "overlay active", until we tell it "inactive" again
@@ -118,8 +169,24 @@ function Content() {
 export default definePlugin(() => {
   void getSettings().then((settings) => { pauseOnQuickAccess = settings.pause_on_quick_access; });
   stopWatching = watchSideMenu((menu) => {
-    signalOverlay(menu);
-    void menuChanged(menu);
+    sideMenu = menu;
+    // a menu closing may be Steam making room for the screensaver: ask before resuming the game
+    if (menu === 0) void isScreensaverActive().then((active) => { screensaverActive = active; report(); });
+    else report();
+  });
+  stopWatchingScreensaver = watchScreensaver((active) => {
+    clearTimeout(screensaverEndTimer);
+    if (active) {
+      screensaverActive = true;
+      report();
+      return;
+    }
+    // Steam restores the menu you were in (e.g. "…") a moment after the screensaver ends; wait for
+    // that instead of resuming the game for a split second in between
+    screensaverEndTimer = window.setTimeout(() => {
+      screensaverActive = false;
+      report();
+    }, SCREENSAVER_END_GRACE_MS);
   });
   return {
     name: "Pause Game on Menu",
@@ -129,6 +196,9 @@ export default definePlugin(() => {
     onDismount() {
       stopWatching?.();
       stopWatching = null;
+      stopWatchingScreensaver?.();
+      stopWatchingScreensaver = null;
+      clearTimeout(screensaverEndTimer);
       if (overlaySignalled !== null) setGameOverlay(false, overlaySignalled);
       overlaySignalled = null;
     },

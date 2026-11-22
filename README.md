@@ -11,6 +11,8 @@ A small [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin
 - **Mute game sound while … or Steam menu is open** — mutes only the game's own audio streams and unmutes
   exactly those when the menu closes.
 
+Steam's screensaver counts as "…": the game stays paused and muted while it shows, and resumes after.
+
 Nothing is frozen: the game keeps running (multiplayer stays connected) and decides itself whether it pauses.
 Games that keep running when unfocused just keep running.
 

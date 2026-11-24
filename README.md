@@ -10,6 +10,8 @@ A small [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin
   there, as after the Steam menu.
 - **Mute game sound while … or Steam menu is open** — mutes only the game's own audio streams and unmutes
   exactly those when the menu closes.
+  If the game dies while muted (crash, kill, Exit from the Steam menu), its next start is not left muted:
+  PipeWire/WirePlumber remembers the mute, so the plugin notes what it muted and undoes it when the game's sound returns.
 
 While a game runs, the panel also shows both switches **for that game only** (e.g. no pause for a multiplayer game,
 or sound kept on for one). They start out like the global switches; changed ones are saved per game.
